@@ -1,18 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { BeforeAgentStartEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { cleanRequestMessages, cleanSystemMessage, isBuiltinDocs, OMIT_DOCS, stripPiDocs } from "./docs.ts";
+import { cleanRequestMessages, dropOmitMarkers, isBuiltinDocs, OMIT_DOCS, stripPiDocs } from "./docs.ts";
 
 export default function piSlim(pi: ExtensionAPI) {
 	// Correlate the actual async submission, not whichever input happens to run next.
 	const requests = new AsyncLocalStorage<{ consumed: boolean }>();
 	let preserveDocs = false;
 	let options: BeforeAgentStartEvent["systemPromptOptions"] | undefined;
-	let restorePresentation: (() => void) | undefined;
-	const restore = () => {
-		const callback = restorePresentation;
-		restorePresentation = undefined;
-		callback?.();
-	};
 
 	pi.registerCommand("pi", {
 		description: "Run a request with Pi's built-in documentation guidance enabled",
@@ -31,7 +25,6 @@ export default function piSlim(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", event => {
-		restore();
 		const token = requests.getStore();
 		preserveDocs = token !== undefined && !token.consumed;
 		if (token) token.consumed = true;
@@ -44,42 +37,18 @@ export default function piSlim(pi: ExtensionAPI) {
 		// Pi still owns their generation, including refreshes between tool calls.
 	});
 
-	pi.on("agent_start", (_event, ctx) => {
-		if (preserveDocs || !options) return;
-		const current = ctx.getSystemPrompt();
-		const clean = stripPiDocs(current);
-		if (clean === current) return;
-
-		// context-view captures ctx.getSystemPrompt() in its first context handler.
-		// Temporarily expose the clean rendering AFTER all before_agent_start hooks.
-		// Restore BEFORE Pi's forced-prompt projection (which follows emitContext),
-		// so this presentation bridge never freezes tools or collapses the transcript.
-		const runOptions = options;
-		const originalForce = runOptions.forceSystemPrompt;
-		runOptions.forceSystemPrompt = clean;
-		restorePresentation = () => {
-			if (runOptions.forceSystemPrompt === clean) {
-				runOptions.forceSystemPrompt = originalForce === undefined ? undefined : stripPiDocs(originalForce);
-			} else if (runOptions.forceSystemPrompt !== undefined) {
-				runOptions.forceSystemPrompt = stripPiDocs(runOptions.forceSystemPrompt);
-			}
-		};
+	// A forced prompt (another extension returned `systemPrompt`) is final once every
+	// before_agent_start handler has run. Clean it before any request is built, so views
+	// that read ctx.getSystemPrompt() see the same text the provider gets.
+	pi.on("agent_start", () => {
+		if (!preserveDocs && options?.forceSystemPrompt !== undefined) options.forceSystemPrompt = stripPiDocs(options.forceSystemPrompt);
 	});
 
-	pi.on("message_end", event => {
-		if (preserveDocs || event.message.role !== "system") return;
-		// Public replacement API: Pi persists the replacement, not the docs/marker.
-		return { message: cleanSystemMessage(event.message) };
-	});
-
+	// The transcript keeps exactly what Pi computed (its next section diff must converge);
+	// docs and the omission marker are removed only from what this request sends.
 	pi.on("context_with_system", event => {
-		restore();
-		if (preserveDocs) return;
-		return { messages: cleanRequestMessages(event.messages) };
+		return { messages: preserveDocs ? dropOmitMarkers(event.messages) : cleanRequestMessages(event.messages) };
 	});
 
-	// Also restore if cancellation/error bypasses context_with_system entirely.
-	pi.on("agent_end", restore);
-	pi.on("agent_settled", () => { restore(); options = undefined; preserveDocs = false; });
-	pi.on("session_shutdown", restore);
+	pi.on("agent_settled", () => { options = undefined; preserveDocs = false; });
 }
