@@ -4,7 +4,9 @@ type Message = ContextWithSystemEvent["messages"][number];
 type SystemMessage = Extract<Message, { role: "system" }>;
 
 // A truthy override is necessary: Pi 0.87.1 regenerates docs for ""/undefined.
-// This marker is removed before persistence and before the provider sees it.
+// The saved sections keep this marker: Pi diffs them against the next request's
+// desired sections, so a cleared docs section would re-add a patch every request.
+// It is removed from every request before the provider sees it.
 export const OMIT_DOCS = "<!-- pi-slim:omit -->";
 const HEADER = "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):";
 
@@ -60,6 +62,14 @@ export function stripPiDocs(text: string): string {
 	return text;
 }
 
+/** The omission marker, bare or wrapped exactly as Pi renders a custom docs section. */
+export function isOmitMarkerSection(value: string): boolean {
+	const text = value.trim();
+	if (text === OMIT_DOCS) return true;
+	const match = /^<docs>\r?\n([\s\S]*?)\r?\n<\/docs>$/.exec(text);
+	return match?.[1].trim() === OMIT_DOCS;
+}
+
 /** Return an owned copy; null sections remove docs left by an earlier /pi run. */
 export function cleanSystemMessage(message: SystemMessage): SystemMessage {
 	const content = typeof message.content === "string" ? stripPiDocs(message.content) : message.content.map(block => {
@@ -70,7 +80,10 @@ export function cleanSystemMessage(message: SystemMessage): SystemMessage {
 	});
 	const sections = message.sections && Object.fromEntries(Object.entries(message.sections).map(([name, value]) => {
 		if (value === null) return [name, value];
-		const clean = name === "docs" && (value.trim() === OMIT_DOCS || isBuiltinDocs(value)) ? "" : stripPiDocs(value);
+		// Keep the marker as built: clearing it here makes Pi's section diff patch the
+		// prompt again on every request, which litters the transcript with empty system messages.
+		if (name === "docs" && isOmitMarkerSection(value)) return [name, value];
+		const clean = name === "docs" && isBuiltinDocs(value) ? "" : stripPiDocs(value);
 		return [name, clean === value ? value : clean || null];
 	}));
 	return { ...message, content, ...(sections && { sections }) };
@@ -84,8 +97,10 @@ export function cleanRequestMessages(messages: Message[]): Message[] {
 		const clean = cleanSystemMessage(message);
 		if (clean.sections?.docs !== undefined) {
 			const docs = clean.sections.docs;
-			if (docs === null && !customDocsPresent) delete clean.sections.docs;
-			customDocsPresent = docs !== null;
+			// The marker is not content: drop it from the request like a deletion tombstone.
+			const omitted = typeof docs === "string" && isOmitMarkerSection(docs);
+			if (omitted || (docs === null && !customDocsPresent)) delete clean.sections.docs;
+			else customDocsPresent = docs !== null;
 		}
 		// Do not send redundant empty system updates or "remove docs" instructions.
 		const emptyContent = typeof clean.content === "string" ? clean.content.length === 0 : clean.content.every(block => block.text.length === 0);

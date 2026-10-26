@@ -101,6 +101,14 @@ function noDocs(value) {
   assert.ok(!text.includes(DOCS_HEADER), 'built-in documentation survived');
   assert.ok(!text.includes('pi-slim:omit'), 'internal omission marker survived');
 }
+// Saved transcripts keep the omission marker so Pi's section diff converges; the guidance must still be gone.
+function noDocsGuidance(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  assert.ok(!text.includes(DOCS_HEADER), 'built-in documentation survived');
+}
+function savedDocs(messages) {
+  return messages.filter((message) => message.role === 'system').map((message) => message.sections?.docs).at(-1);
+}
 function currentText(messages) { return systemMessageText(replaySystemMessages(messages)); }
 async function using(options, fn) {
   const f = await fixture(options);
@@ -111,7 +119,8 @@ async function using(options, fn) {
 test('ordinary request: provider, persisted sections, and both context-view snapshots contain no docs', () => using({}, async f => {
   await f.command('ordinary');
   assert.equal(f.requests.length, 1);
-  noDocs(f.requests); noDocs(f.messages()); noDocs(f.capture.snapshot); noDocs(f.usageSnapshot());
+  noDocs(f.requests); noDocs(f.capture.snapshot); noDocsGuidance(f.messages()); noDocsGuidance(f.usageSnapshot());
+  assert.equal(savedDocs(f.messages()), `<docs>\n${OMIT_DOCS}\n</docs>`);
   assert.ok(currentText(f.requests[0]).includes('KEEP_ADDENDUM'));
   assert.equal(replaySystemMessages(f.requests[0]).sections.docs, undefined);
 }));
@@ -120,8 +129,9 @@ test('later structured rules and selected tools reach both the provider and tran
   pi.on('before_agent_start', e => { e.systemPromptOptions.sections.later = 'LATE_SECTION'; e.systemPromptOptions.promptGuidelines.push('LATE_RULE'); e.systemPromptOptions.selectedTools = ['read']; });
 }] }, async f => {
   await f.command('ordinary');
+  noDocs(f.requests[0]);
   for (const msgs of [f.requests[0], f.messages()]) {
-    const text = currentText(msgs); noDocs(text); assert.match(text, /LATE_SECTION/); assert.match(text, /LATE_RULE/); assert.doesNotMatch(text, /- bash:/);
+    const text = currentText(msgs); noDocsGuidance(text); assert.match(text, /LATE_SECTION/); assert.match(text, /LATE_RULE/); assert.doesNotMatch(text, /- bash:/);
   }
 }));
 
@@ -135,7 +145,7 @@ test('native next-turn refresh stays dynamic across multiple tool calls', () => 
   assert.match(currentText(f.requests[0]), /- bash:/);
   assert.doesNotMatch(currentText(f.requests[1]), /- bash:/);
   assert.match(currentText(f.requests[2]), /- bash:/);
-  noDocs(f.requests); noDocs(f.capture.snapshot); noDocs(f.usageSnapshot());
+  noDocs(f.requests); noDocs(f.capture.snapshot); noDocsGuidance(f.usageSnapshot());
 }));
 
 test('/pi preserves docs for its run without freezing later rules, next ordinary request clears them', () => using({ after: [pi => {
@@ -146,7 +156,7 @@ test('/pi preserves docs for its run without freezing later rules, next ordinary
   assert.match(currentText(f.requests[0]), /Pi documentation/);
   assert.match(currentText(f.requests[0]), /PI_LATE_RULE/);
   await f.command('ordinary');
-  noDocs(f.requests[1]); noDocs(currentText(f.messages())); noDocs(f.usageSnapshot());
+  noDocs(f.requests[1]); noDocsGuidance(currentText(f.messages())); noDocsGuidance(f.usageSnapshot());
 }));
 
 test('input interception of /pi cannot leak permission to the next request', () => using({ before: [pi => {
@@ -165,7 +175,7 @@ test('custom docs, fenced examples, and project instructions are preserved', () 
 
 for (const captureFirst of [false, true]) {
   test(`context-view load order: capture ${captureFirst ? 'before' : 'after'} slim`, () => using({ captureFirst }, async f => {
-    await f.command('ordinary'); noDocs(f.capture.snapshot); noDocs(f.usageSnapshot());
+    await f.command('ordinary'); noDocs(f.capture.snapshot); noDocsGuidance(f.usageSnapshot());
   }));
 }
 for (const position of ['before', 'after']) {
@@ -174,7 +184,7 @@ for (const position of ['before', 'after']) {
   }] }, async f => {
     await f.command('ordinary');
     assert.equal(currentText(f.requests[0]), 'FORCED_KEEP');
-    noDocs(f.requests); noDocs(f.capture.snapshot); noDocs(f.usageSnapshot());
+    noDocs(f.requests); noDocs(f.capture.snapshot); noDocsGuidance(f.usageSnapshot());
   }));
 }
 
@@ -184,7 +194,7 @@ test('ordinary → /pi → ordinary restores docs for exactly one run', () => us
   await f.command('last');
   assert.equal(f.requests.length, 3);
   noDocs(f.requests[0]); assert.match(currentText(f.requests[1]), /Pi documentation/); noDocs(f.requests[2]);
-  noDocs(f.capture.snapshot); noDocs(f.usageSnapshot());
+  noDocs(f.capture.snapshot); noDocsGuidance(f.usageSnapshot());
 }));
 
 test('/pi permission survives an asynchronous input transform, but not the next submission', () => using({ before: [pi => {
@@ -217,7 +227,20 @@ test('/pi includes docs across tool turns; ordinary requests do not accumulate e
     noDocs(msgs);
     for (const msg of msgs.filter(m => m.role === 'system')) assert.ok(!Object.hasOwn(msg.sections ?? {}, 'docs'));
   }
-  noDocs(f.usageSnapshot());
+  noDocsGuidance(f.usageSnapshot());
+}));
+
+test('ordinary requests reuse one system message instead of appending a patch per request', () => using({}, async f => {
+  for (const text of ['one', 'two', 'three']) await f.command(text);
+  assert.equal(f.requests.length, 3);
+  for (const msgs of f.requests) noDocs(msgs);
+  const systems = f.messages().filter((message) => message.role === 'system');
+  assert.equal(systems.length, 1, 'one saved system message, no per-request patches');
+  // The saved prompt keeps the omission marker so Pi's structured section diff stays stable;
+  // every request strips it again before the provider sees it.
+  assert.equal(systems[0].sections.docs, `<docs>\n${OMIT_DOCS}\n</docs>`);
+  assert.equal(savedDocs(f.messages()), `<docs>\n${OMIT_DOCS}\n</docs>`);
+  noDocsGuidance(f.usageSnapshot());
 }));
 
 const { stripPiDocs, cleanSystemMessage, cleanRequestMessages, OMIT_DOCS } = await jiti.import(resolve(here, '../extensions/docs.ts'));
@@ -253,6 +276,34 @@ test('system cleanup is immutable, preserves tools/metadata, and invalidates onl
   assert.equal(clean.content[0].textSignature, undefined); assert.equal(clean.content[1], msg.content[1]);
   assert.equal(clean.toolsAdded, msg.toolsAdded); assert.equal(clean.toolsRemoved, msg.toolsRemoved); assert.equal(clean.timestamp, 123);
   assert.deepEqual(cleanSystemMessage(clean), clean);
+});
+
+test('saved sections keep the omission marker so the next section diff stays stable', () => {
+  const section = `<docs>\n${OMIT_DOCS}\n</docs>`;
+  const message = { role: 'system', content: '', sections: { docs: section, project: 'PROJECT' } };
+  const clean = cleanSystemMessage(message);
+  assert.equal(clean.sections.docs, section);
+  assert.equal(clean.sections.project, 'PROJECT');
+  assert.deepEqual(cleanSystemMessage(clean), clean);
+  // An unwrapped marker is left alone too; Pi rewrites it to its rendered form on the next run.
+  assert.equal(cleanSystemMessage({ role: 'system', content: '', sections: { docs: OMIT_DOCS } }).sections.docs, OMIT_DOCS);
+});
+
+test('request cleanup drops the saved marker without treating it as custom docs', () => {
+  const section = `<docs>\n${OMIT_DOCS}\n</docs>`;
+  const source = [{ role: 'system', content: '', sections: { preamble: 'BASE', docs: section } },
+    { role: 'user', content: 'hi' },
+    { role: 'system', content: '', sections: { docs: section } },
+    { role: 'system', content: '', sections: { project: 'LATER' } }];
+  const clean = cleanRequestMessages(source);
+  assert.deepEqual(clean.map((message) => message.role), ['system', 'user', 'system']);
+  assert.ok(!Object.hasOwn(clean[0].sections, 'docs'));
+  assert.equal(clean[1].content, 'hi');
+  assert.equal(clean[2].sections.project, 'LATER');
+  const custom = [{ role: 'system', content: '', sections: { docs: section } },
+    { role: 'system', content: '', sections: { docs: '<docs>PROJECT</docs>' } },
+    { role: 'system', content: '', sections: { docs: null } }];
+  assert.deepEqual(cleanRequestMessages(custom).slice(1), custom.slice(1));
 });
 
 test('request cleanup removes old docs and no-op tombstones without touching user/assistant/tool messages', () => {

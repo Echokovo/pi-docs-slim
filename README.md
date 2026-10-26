@@ -32,7 +32,7 @@ The original 0.2.1 removes the docs by replacing a string in the system prompt. 
 
 What this fork changes:
 
-- **Removes the docs from the new structured prompt.** It blocks Pi from filling the docs section back in, and cleans the system messages before they are saved and before they are sent.
+- **Removes the docs from the new structured prompt.** It blocks Pi from filling the docs section back in, and strips the docs from every request before the provider sees them. The saved system message keeps a short `<!-- pi-slim:omit -->` marker in that section: Pi derives each request's sections from the transcript, so a cleared section makes it append an empty system message to every request.
 - **Cleans old history too.** Docs left over from an earlier `/pi` run are stripped from later normal requests.
 - **Keeps `/context` accurate.** [pi-context-view](https://www.npmjs.com/package/pi-context-view) shows the cleaned prompt, not the original.
 - **Makes `/pi` reliable.** The "keep docs" permission is tied to the exact request `/pi` sends, so it can't leak into your next message if that request gets intercepted.
@@ -58,6 +58,7 @@ Set `PI_SLIM_ENTRY` to run the suite against another implementation.
 ## Limits
 
 - Old session files aren't rewritten. `/context`'s Usage view is clean after the next normal request. The Initial view is a snapshot from the first request; reload to refresh it. If that first request was `/pi`, it will include the docs, which is expected.
+- Saved sessions keep the ~20-character omission marker in their `docs` section so Pi's per-request section diff converges. The marker is removed from every request, but `/context`'s Usage view may show it in the base prompt text.
 - If the model reads Pi's docs with a tool, that output is kept.
 - The cleanup relies on Pi 0.87.1's event order. Rerun the tests after upgrading Pi. If another extension re-injects the docs after the final context step, they won't be removed.
 

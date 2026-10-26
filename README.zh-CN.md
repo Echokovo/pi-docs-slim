@@ -32,7 +32,7 @@ pi install npm:@ssk_dev/pi-docs-slim
 
 这个 fork 改了这些：
 
-- **在新的结构化提示词里去掉文档说明。** 不让 Pi 把 docs section 重新填回来，system 消息在保存前、发送前都会清理。
+- **在新的结构化提示词里去掉文档说明。** 不让 Pi 把 docs section 重新填回来，每条请求发出前都会把文档说明去掉。保存下来的 system 消息里会留一个很短的 `<!-- pi-slim:omit -->` 标记：Pi 每次请求都拿 transcript 里的 section 做 diff，如果这里清空，它就会给每条请求追加一条空的 system 消息。
 - **旧历史也清理。** 之前 `/pi` 留下的文档说明，在后面的普通请求里会被去掉。
 - **`/context` 显示的是实际内容。** [pi-context-view](https://www.npmjs.com/package/pi-context-view) 看到的是清理后的提示词，而不是原始版本。
 - **`/pi` 更可靠。** “保留文档”的许可只绑定到 `/pi` 发出的那一次请求；就算这次请求被拦截，也不会漏到你的下一条消息。
@@ -58,6 +58,7 @@ PI_CODING_AGENT_DIR=/path/to/pi-coding-agent PI_CONTEXT_VIEW_DIR=/path/to/pi-con
 ## 限制
 
 - 不改写旧的会话文件。`/context` 的 Usage 视图在下一条普通请求后就是干净的。Initial 视图是第一次请求时的快照，要重新加载才会更新；如果第一次请求用的是 `/pi`，里面有文档说明是正常的。
+- 保存下来的会话会在 `docs` section 里留一个约 20 字符的省略标记，这样 Pi 每次请求的 section diff 才能稳定。标记不会发给模型，但 `/context` 的 Usage 视图里基础提示词那段可能看得到。
 - 模型自己用工具去读 Pi 文档，读到的内容会保留。
 - 清理逻辑依赖 Pi 0.87.1 的事件顺序，升级 Pi 后要重跑测试。如果别的扩展在最后一步上下文处理之后又塞回文档说明，这里清不掉。
 
