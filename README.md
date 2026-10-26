@@ -22,7 +22,7 @@ Requires Pi 0.87.1 or newer (tested on 0.87.1, 1.0.0 and 1.4.0).
 
 - Normal requests: Pi's documentation guidance is removed from what the model sees.
 - `/pi <question about Pi>`: this run reads the guidance at the head of its own message instead of in the system prompt, and keeps it for its tool-call turns. The next normal request goes back to removing it.
-- Your own `<docs>` blocks, project instructions, and code examples are left alone. User messages, assistant replies, and tool output are never touched.
+- Your own `<docs>` blocks, project instructions, and code examples are left alone. Saved user messages, assistant replies, and tool output are never changed (`/pi` only adds the guidance to the request it sends).
 
 After installing or updating, run `/reload`, send a normal message, and check `/context`.
 
@@ -36,7 +36,7 @@ What this fork changes:
 - **Cleans old history too.** Docs left over from an earlier `/pi` run are stripped from later normal requests.
 - **Works with `/context` in any load order.** [pi-context-view](https://www.npmjs.com/package/pi-context-view) never shows Pi's docs and never mislabels the prompt as forced, whether it loads before or after this extension (see Limits for the marker).
 - **Makes `/pi` reliable.** The "keep docs" permission is tied to the exact request `/pi` sends, so it can't leak into your next message if that request gets intercepted.
-- **Keeps `/pi` off the prompt cache.** Putting the guidance back into the system prompt rewrites the first message of the session, so the provider has to re-read everything after it: one `/pi` run cost two full cache misses (the run itself, plus the normal request that switched the section back off). Now the system prompt is byte-identical for every request, and `/pi` only adds about 500 tokens at the tail.
+- **`/pi` no longer breaks the prompt cache.** Most providers get the system prompt at the very start of the request, so putting the guidance back into it made the provider re-read the whole session: one `/pi` run cost two full cache misses (the run itself, plus the normal request that switched the section back off). Now the system prompt is byte-identical for every request and the cached prefix before `/pi` is kept. Only the `/pi` run itself is new: about 500 tokens of guidance, plus re-reading that run once on the next normal request, which no longer carries the guidance.
 - **Doesn't freeze the prompt.** Tools and rules added later by other extensions still show up.
 - **Adds offline integration tests.** They run real Pi sessions with an offline model provider, so no model service is called.
 

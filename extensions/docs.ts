@@ -26,8 +26,11 @@ export function isBuiltinDocs(body: string): boolean {
 		&& lines[7] === "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)";
 }
 
-/** Only visit top-level blocks. Nested instructions and fenced examples are user content. */
-export function stripPiDocs(text: string): string {
+/**
+ * Only visit top-level blocks. Nested instructions and fenced examples are user content.
+ * `removed` collects the guidance that was stripped (not omission markers), in order.
+ */
+export function stripPiDocs(text: string, removed?: string[]): string {
 	const pattern = /^<([a-z][a-z0-9_-]*)(?:[ \t]+[^>\r\n]*)?>\r?\n|^ {0,3}(`{3,}|~{3,})([^\r\n]*)|^Pi documentation \(read only[^\r\n]*/gm;
 	let fence: string | undefined;
 	for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
@@ -48,10 +51,12 @@ export function stripPiDocs(text: string): string {
 			const body = text.slice(pattern.lastIndex, close.index);
 			pattern.lastIndex = end;
 			if (!/^<docs>\r?\n$/.test(match[0]) || (body.trim() !== OMIT_DOCS && !isBuiltinDocs(body))) continue;
+			if (body.trim() !== OMIT_DOCS) removed?.push(body.trim());
 		} else {
 			// Legacy/extension-produced unwrapped guidance: require all eight native lines.
 			const block = text.slice(match.index).match(/^(?:[^\r\n]*\r?\n){7}[^\r\n]*/)?.[0];
 			if (!block || !isBuiltinDocs(block)) continue;
+			removed?.push(block.trim());
 			end = match.index + block.length;
 			pattern.lastIndex = end;
 		}
@@ -114,31 +119,33 @@ export function renderDocsBlock(docs: string): string {
 	return `<pi_docs>\nPi's built-in documentation guidance, provided for this request instead of the system prompt:\n${docs}\n</pi_docs>`;
 }
 
-/** Find Pi's own docs section in a rendered prompt. Custom or fenced `<docs>` blocks are not Pi's. */
+/** Pi's own guidance in a rendered prompt: exactly what stripPiDocs would remove from it. */
 export function extractBuiltinDocs(prompt: string): string | undefined {
-	// A quoted copy of the guidance (an example inside a custom prompt) is not Pi's own section.
-	for (const match of prompt.replace(/```[\s\S]*?```/g, "").matchAll(/<docs>[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*<\/docs>/g)) {
-		if (isBuiltinDocs(match[1])) return match[1].trim();
-	}
-	return undefined;
+	const removed: string[] = [];
+	stripPiDocs(prompt, removed);
+	return removed[0];
 }
+
+/** The /pi run's message; `timestamp` anchors it once found, so later turns reuse the same one. */
+export interface RunPrompt { prompt: string; timestamp?: number }
 
 /**
  * Put the guidance in front of the user message that started the /pi run. The system prompt is
  * untouched, so the request keeps the prefix of every earlier request and the provider's prompt
- * cache survives; only this message and what follows it are new tokens. Prepending to the same
- * message on each turn of the run keeps that prefix stable across the run's tool calls too.
+ * cache survives; only this message and what follows it are new tokens. Every turn of the run
+ * prepends to the same anchored message, so steering messages (even ones that start with the
+ * same text) can't move the guidance and break the prefix cached by the run's earlier turns.
  */
-export function prependDocsToRunPrompt(messages: Message[], prompt: string, block: string): Message[] {
-	let index = -1;
-	for (let i = messages.length - 1; i >= 0 && index < 0; i--) {
+export function prependDocsToRunPrompt(messages: Message[], run: RunPrompt, block: string): Message[] {
+	let index = run.timestamp === undefined ? -1 : messages.findLastIndex(m => m.role === "user" && m.timestamp === run.timestamp);
+	// First turn, or a compaction dropped the anchor: find the prompt, else the last user message.
+	for (let i = messages.length - 1; index < 0 && i >= 0; i--) {
 		const message = messages[i];
-		if (message.role === "user" && userText(message).startsWith(prompt)) index = i;
+		if (message.role === "user" && userText(message).startsWith(run.prompt)) index = i;
 	}
-	// Queued next-turn messages or a compaction can move the run's prompt. The last user message
-	// is still the tail, so the cached prefix survives either way.
 	for (let i = messages.length - 1; index < 0 && i >= 0; i--) if (messages[i].role === "user") index = i;
 	if (index < 0) return messages;
+	run.timestamp = messages[index].timestamp;
 	return messages.map((message, i) => i === index ? withDocs(message as UserMessage, block) : message);
 }
 

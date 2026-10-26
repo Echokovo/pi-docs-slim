@@ -1,11 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { BeforeAgentStartEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { cleanRequestMessages, extractBuiltinDocs, isBuiltinDocs, OMIT_DOCS, prependDocsToRunPrompt, renderDocsBlock, stripPiDocs } from "./docs.ts";
+import { cleanRequestMessages, extractBuiltinDocs, isBuiltinDocs, OMIT_DOCS, prependDocsToRunPrompt, renderDocsBlock, type RunPrompt, stripPiDocs } from "./docs.ts";
 
 export default function piSlim(pi: ExtensionAPI) {
 	// Correlate the actual async submission, not whichever input happens to run next.
 	const requests = new AsyncLocalStorage<{ consumed: boolean }>();
-	let docsTail: { prompt: string; block: string } | undefined;
+	let docsTail: { run: RunPrompt; block: string } | undefined;
 	let options: BeforeAgentStartEvent["systemPromptOptions"] | undefined;
 
 	pi.registerCommand("pi", {
@@ -42,7 +42,7 @@ export default function piSlim(pi: ExtensionAPI) {
 		// Pi still owns their generation, including refreshes between tool calls.
 		// /pi receives the guidance at the head of its own message instead of in the prompt, so
 		// the request keeps the prefix of earlier requests and the provider's prompt cache holds.
-		if (guidance !== undefined && prompt !== undefined) docsTail = { prompt, block: renderDocsBlock(guidance) };
+		if (guidance !== undefined && prompt !== undefined) docsTail = { run: { prompt }, block: renderDocsBlock(guidance) };
 	});
 
 	// A forced prompt (another extension returned `systemPrompt`) is final once every
@@ -56,7 +56,7 @@ export default function piSlim(pi: ExtensionAPI) {
 	// and the omission marker are removed only from what this request sends.
 	pi.on("context_with_system", event => {
 		const messages = cleanRequestMessages(event.messages);
-		return { messages: docsTail ? prependDocsToRunPrompt(messages, docsTail.prompt, docsTail.block) : messages };
+		return { messages: docsTail ? prependDocsToRunPrompt(messages, docsTail.run, docsTail.block) : messages };
 	});
 
 	pi.on("agent_settled", () => { options = undefined; docsTail = undefined; });

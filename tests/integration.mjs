@@ -463,6 +463,10 @@ test('extractBuiltinDocs reads Pi\'s own section, never a custom or quoted copy'
   assert.equal(extractBuiltinDocs(`PREAMBLE\n<docs>\n${OMIT_DOCS}\n</docs>`), undefined);
   assert.equal(extractBuiltinDocs('```xml\n' + nativeDocs + '\n```'), undefined);
   assert.equal(extractBuiltinDocs(renderDocsBlock(nativeBody)), undefined);
+  // Same rules as stripPiDocs: bare guidance counts, copies nested in a block or in any fence don't.
+  assert.equal(extractBuiltinDocs(`FORCED\n\n${nativeBody}\n\nTAIL`), nativeBody);
+  assert.equal(extractBuiltinDocs('~~~\n' + nativeDocs + '\n~~~'), undefined);
+  assert.equal(extractBuiltinDocs(`<example>\n${nativeDocs}\n</example>`), undefined);
 });
 
 test('the guidance heads the /pi message, falls back to the last user message, and touches nothing else', () => {
@@ -472,15 +476,48 @@ test('the guidance heads the /pi message, falls back to the last user message, a
   const reply = { role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: 3 };
   const messages = [earlier, trigger, reply];
 
-  const withDocs = prependDocsToRunPrompt(messages, 'explain themes', block);
+  const withDocs = prependDocsToRunPrompt(messages, { prompt: 'explain themes' }, block);
   assert.equal(withDocs[0], earlier); assert.equal(withDocs[2], reply);
   assert.deepEqual(withDocs[1].content[0], { type: 'text', text: block });
   assert.deepEqual(withDocs[1].content.slice(1), trigger.content);
   assert.equal(trigger.content.length, 2, 'the saved message must not grow');
 
-  assert.equal(prependDocsToRunPrompt([{ role: 'user', content: 'plain question' }], 'plain question', block)[0].content, `${block}\n\nplain question`);
+  assert.equal(prependDocsToRunPrompt([{ role: 'user', content: 'plain question' }], { prompt: 'plain question' }, block)[0].content, `${block}\n\nplain question`);
   // A queued next-turn message or a compaction can move the prompt; the last user message keeps
   // the cached prefix intact either way.
-  assert.ok(userText(prependDocsToRunPrompt([earlier, reply], 'gone', block)[0]).startsWith(block));
-  assert.equal(prependDocsToRunPrompt([reply], 'gone', block)[0], reply);
+  assert.ok(userText(prependDocsToRunPrompt([earlier, reply], { prompt: 'gone' }, block)[0]).startsWith(block));
+  assert.equal(prependDocsToRunPrompt([reply], { prompt: 'gone' }, block)[0], reply);
 });
+
+test('the guidance stays anchored to the first message it was given to', () => {
+  const block = renderDocsBlock('DOCS');
+  const u = (text, timestamp) => ({ role: 'user', content: [{ type: 'text', text }], timestamp });
+  const reply = { role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: 3 };
+  const run = { prompt: 'explain' };
+  const at = (messages) => messages.findIndex((m) => m.role === 'user' && userText(m).startsWith(block));
+  assert.equal(at(prependDocsToRunPrompt([u('earlier', 1), u('explain', 2), reply], run, block)), 1);
+  // A steering message that starts with the same text must not take the guidance away.
+  assert.equal(at(prependDocsToRunPrompt([u('earlier', 1), u('explain', 2), reply, u('explain more', 4)], run, block)), 1);
+  // A compaction that drops the anchored message re-anchors once, then stays put.
+  assert.equal(at(prependDocsToRunPrompt([u('summary', 5), u('explain more', 4)], run, block)), 1);
+  assert.equal(at(prependDocsToRunPrompt([u('summary', 5), u('explain more', 4), reply, u('explain again', 6)], run, block)), 1);
+});
+
+test('/pi keeps the guidance on its own message when a steering message starts with the same text', () => using({ after: [pi => {
+  pi.registerTool({ name: 'switch_tools', label: 'Steer', description: 'Steers', parameters: { type: 'object', properties: {} },
+    async execute() { pi.sendUserMessage('explain tools in more depth', { deliverAs: 'steer' }); return { content: [{ type: 'text', text: 'done' }], details: {} }; } });
+}], replies: n => n === 1 ? { content: [{ type: 'toolCall', id: 'steer-1', name: 'switch_tools', arguments: {} }], stopReason: 'toolUse' } : undefined }, async f => {
+  await f.command('/pi explain tools');
+  assert.equal(f.requests.length, 2);
+  assert.ok(JSON.stringify(f.requests[1]).includes('explain tools in more depth'), 'the steering message was not delivered');
+  assert.deepEqual(piDocs(f.requests[1]), piDocs(f.requests[0]), 'the guidance moved to the steering message');
+  samePrompt(f.requests, '/pi with steering');
+}));
+
+test('/pi still gets the guidance when an earlier extension forced a prompt with bare guidance', () => using({ before: [pi => {
+  pi.on('before_agent_start', () => ({ systemPrompt: `FORCED_KEEP\n\n${nativeBody}` }));
+}] }, async f => {
+  await f.command('/pi explain extensions');
+  piDocs(f.requests[0]);
+  assert.match(currentText(f.requests[0]), /FORCED_KEEP/);
+}));
