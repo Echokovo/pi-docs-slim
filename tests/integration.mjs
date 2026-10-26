@@ -88,6 +88,7 @@ async function contextView08() {
 const { buildSystemPromptSections } = await import(pathToFileURL(join(root, 'dist/core/system-prompt.js')));
 const nativeDocs = buildSystemPromptSections({ cwd: here }).docs;
 const DOCS_HEADER = 'Pi documentation (read only';
+const DOCS_BLOCK = '<pi_docs>';
 const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost };
 
@@ -177,6 +178,25 @@ function noCountedDocs(snapshot, { marker = false } = {}) {
   };
   visit(snapshot);
 }
+// /pi hands the guidance over at the head of its own user message, never in the prompt, so the
+// request keeps the prefix of every earlier request and the provider's prompt cache survives.
+const userText = (message) => typeof message.content === 'string' ? message.content
+  : message.content.map(part => part.type === 'text' ? part.text : '').join('');
+function piDocs(request) {
+  const hits = request.map((message, i) => message.role === 'user' && userText(message).includes(DOCS_HEADER) ? i : -1).filter(i => i >= 0);
+  assert.equal(hits.length, 1, 'exactly one user message carries the guidance');
+  const content = request[hits[0]].content;
+  const head = Array.isArray(content) ? content[0].text : content;
+  assert.ok(head.startsWith(DOCS_BLOCK), 'the guidance must head the message');
+  assert.ok(!currentText(request).includes(DOCS_HEADER), 'the guidance leaked into the system prompt');
+  return { index: hits[0], block: head };
+}
+// Any change to the system messages a request carries invalidates the whole cached prefix.
+function samePrompt(requests, label) {
+  const prompts = requests.map((msgs) => JSON.stringify(msgs.filter((message) => message.role === 'system')));
+  prompts.forEach((prompt, i) => assert.equal(prompt, prompts[0], `${label}: request ${i} changed the system prompt`));
+}
+
 function savedDocs(messages) {
   return messages.filter((message) => message.role === 'system').map((message) => message.sections?.docs).at(-1);
 }
@@ -219,17 +239,18 @@ test('native next-turn refresh stays dynamic across multiple tool calls', () => 
   noDocs(f.requests); f.viewClean();
 }));
 
-test('/pi preserves docs for its run without freezing later rules, next ordinary request clears them', () => using({ after: [pi => {
+test('/pi sends docs in its own message without freezing later rules, next ordinary request clears them', () => using({ after: [pi => {
   pi.on('before_agent_start', e => { e.systemPromptOptions.sections.later = 'PI_LATE_RULE'; });
 }] }, async f => {
   await f.command('/pi explain extensions');
   assert.equal(f.requests.length, 1);
-  assert.match(currentText(f.requests[0]), /Pi documentation/);
+  piDocs(f.requests[0]);
   assert.match(currentText(f.requests[0]), /PI_LATE_RULE/);
+  samePrompt(f.requests, '/pi run');
   await f.command('ordinary');
   noDocs(f.requests[1]); noDocsGuidance(currentText(f.messages())); f.viewClean({ firstRunWasPi: true });
+  samePrompt(f.requests, 'after /pi');
 }));
-
 test('input interception of /pi cannot leak permission to the next request', () => using({ before: [pi => {
   pi.on('input', e => e.text === 'intercept' ? { action: 'handled' } : undefined);
 }] }, async f => {
@@ -269,12 +290,17 @@ for (const captureFirst of [false, true]) {
   }
 }
 
-test('ordinary → /pi → ordinary restores docs for exactly one run', () => using({}, async f => {
+test('ordinary → /pi → ordinary keeps the prompt cached and the docs in one request only', () => using({}, async f => {
   await f.command('first');
   await f.command('/pi explain themes');
   await f.command('last');
   assert.equal(f.requests.length, 3);
-  noDocs(f.requests[0]); assert.match(currentText(f.requests[1]), /Pi documentation/); noDocs(f.requests[2]);
+  noDocs(f.requests[0]); piDocs(f.requests[1]); noDocs(f.requests[2]);
+  samePrompt(f.requests, 'ordinary → /pi → ordinary');
+  assert.equal(f.messages().filter((message) => message.role === 'system').length, 1, '/pi appended a system prompt patch');
+  assert.ok(JSON.stringify(f.requests[2]).includes('explain themes'), 'the /pi question vanished from history');
+  assert.ok(!JSON.stringify(f.requests[2]).includes(DOCS_BLOCK), 'the ephemeral guidance leaked into a later request');
+  noDocsGuidance(f.messages());
   f.viewClean();
 }));
 
@@ -282,9 +308,10 @@ test('/pi permission survives an asynchronous input transform, but not the next 
   pi.on('input', async e => { await Promise.resolve(); return { action: 'transform', text: `TRANSFORMED ${e.text}` }; });
 }] }, async f => {
   await f.command('/pi explain themes');
-  assert.match(currentText(f.requests[0]), /Pi documentation/);
+  piDocs(f.requests[0]);
   assert.ok(JSON.stringify(f.requests[0]).includes('TRANSFORMED explain themes'));
   await f.command('ordinary'); noDocs(f.requests[1]);
+  samePrompt(f.requests, 'transformed /pi');
 }));
 
 test('project-owned structured docs survive ordinary requests', () => using({ before: [pi => {
@@ -295,19 +322,19 @@ test('project-owned structured docs survive ordinary requests', () => using({ be
   assert.ok(JSON.stringify(f.usageSnapshot()).includes('PROJECT_DOCS_SECTION'));
 }));
 
-test('/pi includes docs across tool turns; ordinary requests do not accumulate empty docs updates', () => using({ after: [pi => {
+test('/pi keeps the guidance on one message across tool turns; ordinary requests add no docs patch', () => using({ after: [pi => {
   pi.registerTool({ name: 'switch_tools', label: 'Switch', description: 'No-op', parameters: { type: 'object', properties: {} },
     async execute() { return { content: [{ type: 'text', text: 'done' }], details: {} }; } });
 }], replies: n => n === 1 || n === 3 ? { content: [{ type: 'toolCall', id: `noop-${n}`, name: 'switch_tools', arguments: {} }], stopReason: 'toolUse' } : undefined }, async f => {
   await f.command('/pi explain tools');
   assert.equal(f.requests.length, 2);
-  for (const msgs of f.requests) assert.match(currentText(msgs), /Pi documentation/);
+  assert.deepEqual(f.requests.map(piDocs)[1], f.requests.map(piDocs)[0], 'the guidance must stay on the same message so the prefix stays cached');
+  samePrompt(f.requests, '/pi tool turns');
   await f.command('ordinary');
   assert.equal(f.requests.length, 4);
-  for (const msgs of f.requests.slice(2)) {
-    noDocs(msgs);
-    for (const msg of msgs.filter(m => m.role === 'system')) assert.ok(!Object.hasOwn(msg.sections ?? {}, 'docs'));
-  }
+  for (const msgs of f.requests.slice(2)) noDocs(msgs);
+  for (const msgs of f.requests) assert.equal(msgs.filter((message) => message.role === 'system').length, 1);
+  assert.equal(savedDocs(f.messages()), `<docs>\n${OMIT_DOCS}\n</docs>`);
   f.viewClean({ firstRunWasPi: true });
 }));
 
@@ -324,7 +351,7 @@ test('ordinary requests reuse one system message instead of appending a patch pe
   f.viewClean();
 }));
 
-const { stripPiDocs, cleanSystemMessage, cleanRequestMessages, OMIT_DOCS } = await jiti.import(resolve(here, '../extensions/docs.ts'));
+const { cleanRequestMessages, cleanSystemMessage, extractBuiltinDocs, OMIT_DOCS, prependDocsToRunPrompt, renderDocsBlock, stripPiDocs } = await jiti.import(resolve(here, '../extensions/docs.ts'));
 const nativeBody = nativeDocs.slice('<docs>\n'.length, -'\n</docs>'.length);
 
 test('parser: complete native blocks, CRLF, repeated blocks, and omission markers', () => {
@@ -424,6 +451,36 @@ test('custom docs removed by a later run do not linger in the request', () => us
 test('/pi after an ordinary request sends the docs but not the saved omission marker', () => using({}, async f => {
   await f.command('ordinary');
   await f.command('/pi explain extensions');
-  assert.match(currentText(f.requests[1]), /Pi documentation/);
+  piDocs(f.requests[1]);
   assert.ok(!JSON.stringify(f.requests[1]).includes('pi-slim:omit'), 'marker sent to provider during /pi');
+  samePrompt(f.requests, 'ordinary then /pi');
 }));
+
+test('extractBuiltinDocs reads Pi\'s own section, never a custom or quoted copy', () => {
+  assert.equal(extractBuiltinDocs(`PREAMBLE\n\n${nativeDocs}\n\n<cwd>\n/x\n</cwd>`), nativeBody);
+  assert.equal(extractBuiltinDocs(`A\n<docs>\n${nativeBody}\n</docs>\nB\n<docs>\n${nativeBody}\n</docs>`), nativeBody);
+  assert.equal(extractBuiltinDocs('CUSTOM\n<docs>\nPROJECT_API\n</docs>'), undefined);
+  assert.equal(extractBuiltinDocs(`PREAMBLE\n<docs>\n${OMIT_DOCS}\n</docs>`), undefined);
+  assert.equal(extractBuiltinDocs('```xml\n' + nativeDocs + '\n```'), undefined);
+  assert.equal(extractBuiltinDocs(renderDocsBlock(nativeBody)), undefined);
+});
+
+test('the guidance heads the /pi message, falls back to the last user message, and touches nothing else', () => {
+  const block = renderDocsBlock('DOCS');
+  const earlier = { role: 'user', content: [{ type: 'text', text: 'earlier explain themes' }], timestamp: 1 };
+  const trigger = { role: 'user', content: [{ type: 'text', text: 'explain themes' }, { type: 'image', data: 'x', mimeType: 'image/png' }], timestamp: 2 };
+  const reply = { role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: 3 };
+  const messages = [earlier, trigger, reply];
+
+  const withDocs = prependDocsToRunPrompt(messages, 'explain themes', block);
+  assert.equal(withDocs[0], earlier); assert.equal(withDocs[2], reply);
+  assert.deepEqual(withDocs[1].content[0], { type: 'text', text: block });
+  assert.deepEqual(withDocs[1].content.slice(1), trigger.content);
+  assert.equal(trigger.content.length, 2, 'the saved message must not grow');
+
+  assert.equal(prependDocsToRunPrompt([{ role: 'user', content: 'plain question' }], 'plain question', block)[0].content, `${block}\n\nplain question`);
+  // A queued next-turn message or a compaction can move the prompt; the last user message keeps
+  // the cached prefix intact either way.
+  assert.ok(userText(prependDocsToRunPrompt([earlier, reply], 'gone', block)[0]).startsWith(block));
+  assert.equal(prependDocsToRunPrompt([reply], 'gone', block)[0], reply);
+});

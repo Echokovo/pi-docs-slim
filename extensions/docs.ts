@@ -2,6 +2,7 @@ import type { ContextWithSystemEvent } from "@earendil-works/pi-coding-agent";
 
 type Message = ContextWithSystemEvent["messages"][number];
 type SystemMessage = Extract<Message, { role: "system" }>;
+type UserMessage = Extract<Message, { role: "user" }>;
 
 // A truthy override is necessary: Pi 0.87.1 regenerates docs for ""/undefined.
 // The saved sections keep this marker: Pi diffs them against the next request's
@@ -108,15 +109,46 @@ export function cleanRequestMessages(messages: Message[]): Message[] {
 	});
 }
 
-/** A /pi run keeps Pi's docs, but the saved omission marker still must not reach the provider. */
-export function dropOmitMarkers(messages: Message[]): Message[] {
-	return messages.flatMap<Message>((message, index) => {
-		const docs = message.role === "system" ? message.sections?.docs : undefined;
-		if (message.role !== "system" || typeof docs !== "string" || !isOmitMarkerSection(docs)) return [message];
-		const { docs: _marker, ...sections } = message.sections!;
-		const clean = { ...message, sections };
-		return index > 0 && isEmptySystem(clean) ? [] : [clean];
-	});
+/** Pi's own guidance, handed to the model inside its own message instead of the system prompt. */
+export function renderDocsBlock(docs: string): string {
+	return `<pi_docs>\nPi's built-in documentation guidance, provided for this request instead of the system prompt:\n${docs}\n</pi_docs>`;
+}
+
+/** Find Pi's own docs section in a rendered prompt. Custom or fenced `<docs>` blocks are not Pi's. */
+export function extractBuiltinDocs(prompt: string): string | undefined {
+	// A quoted copy of the guidance (an example inside a custom prompt) is not Pi's own section.
+	for (const match of prompt.replace(/```[\s\S]*?```/g, "").matchAll(/<docs>[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*<\/docs>/g)) {
+		if (isBuiltinDocs(match[1])) return match[1].trim();
+	}
+	return undefined;
+}
+
+/**
+ * Put the guidance in front of the user message that started the /pi run. The system prompt is
+ * untouched, so the request keeps the prefix of every earlier request and the provider's prompt
+ * cache survives; only this message and what follows it are new tokens. Prepending to the same
+ * message on each turn of the run keeps that prefix stable across the run's tool calls too.
+ */
+export function prependDocsToRunPrompt(messages: Message[], prompt: string, block: string): Message[] {
+	let index = -1;
+	for (let i = messages.length - 1; i >= 0 && index < 0; i--) {
+		const message = messages[i];
+		if (message.role === "user" && userText(message).startsWith(prompt)) index = i;
+	}
+	// Queued next-turn messages or a compaction can move the run's prompt. The last user message
+	// is still the tail, so the cached prefix survives either way.
+	for (let i = messages.length - 1; index < 0 && i >= 0; i--) if (messages[i].role === "user") index = i;
+	if (index < 0) return messages;
+	return messages.map((message, i) => i === index ? withDocs(message as UserMessage, block) : message);
+}
+
+function userText(message: UserMessage): string {
+	return typeof message.content === "string" ? message.content : message.content.map(part => part.type === "text" ? part.text : "").join("");
+}
+
+function withDocs(message: UserMessage, block: string): UserMessage {
+	if (typeof message.content === "string") return { ...message, content: `${block}\n\n${message.content}` };
+	return { ...message, content: [{ type: "text", text: block }, ...message.content] };
 }
 
 function isEmptySystem(message: SystemMessage): boolean {
