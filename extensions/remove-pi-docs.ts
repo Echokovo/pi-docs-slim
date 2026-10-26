@@ -1,11 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { BeforeAgentStartEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { cleanRequestMessages, dropOmitMarkers, isBuiltinDocs, OMIT_DOCS, stripPiDocs } from "./docs.ts";
+import { cleanRequestMessages, extractBuiltinDocs, isBuiltinDocs, OMIT_DOCS, prependDocsToRunPrompt, renderDocsBlock, type RunPrompt, stripPiDocs } from "./docs.ts";
 
 export default function piSlim(pi: ExtensionAPI) {
 	// Correlate the actual async submission, not whichever input happens to run next.
 	const requests = new AsyncLocalStorage<{ consumed: boolean }>();
-	let preserveDocs = false;
+	let docsTail: { run: RunPrompt; block: string } | undefined;
 	let options: BeforeAgentStartEvent["systemPromptOptions"] | undefined;
 
 	pi.registerCommand("pi", {
@@ -26,29 +26,38 @@ export default function piSlim(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", event => {
 		const token = requests.getStore();
-		preserveDocs = token !== undefined && !token.consumed;
+		const preserveDocs = token !== undefined && !token.consumed;
 		if (token) token.consumed = true;
 		options = event.systemPromptOptions;
-		if (preserveDocs) return;
+		docsTail = undefined;
 
 		const docs = options.sections.docs;
-		if (!docs || isBuiltinDocs(docs)) options.sections.docs = OMIT_DOCS;
+		const native = !docs || isBuiltinDocs(docs);
+		const prompt = event.messageType === "user" ? event.prompt : undefined;
+		// Read the rendered prompt before the marker replaces the section: it is the only place
+		// Pi spells the guidance out, so this extension never has to duplicate the text.
+		const guidance = preserveDocs && native && prompt !== undefined ? extractBuiltinDocs(event.systemPrompt) : undefined;
+		if (native) options.sections.docs = OMIT_DOCS;
 		// Never return a full systemPrompt or fold tools/rules into customPrompt.
 		// Pi still owns their generation, including refreshes between tool calls.
+		// /pi receives the guidance at the head of its own message instead of in the prompt, so
+		// the request keeps the prefix of earlier requests and the provider's prompt cache holds.
+		if (guidance !== undefined && prompt !== undefined) docsTail = { run: { prompt }, block: renderDocsBlock(guidance) };
 	});
 
 	// A forced prompt (another extension returned `systemPrompt`) is final once every
 	// before_agent_start handler has run. Clean it before any request is built, so views
 	// that read ctx.getSystemPrompt() see the same text the provider gets.
 	pi.on("agent_start", () => {
-		if (!preserveDocs && options?.forceSystemPrompt !== undefined) options.forceSystemPrompt = stripPiDocs(options.forceSystemPrompt);
+		if (options?.forceSystemPrompt !== undefined) options.forceSystemPrompt = stripPiDocs(options.forceSystemPrompt);
 	});
 
-	// The transcript keeps exactly what Pi computed (its next section diff must converge);
-	// docs and the omission marker are removed only from what this request sends.
+	// The transcript keeps exactly what Pi computed (its next section diff must converge); docs
+	// and the omission marker are removed only from what this request sends.
 	pi.on("context_with_system", event => {
-		return { messages: preserveDocs ? dropOmitMarkers(event.messages) : cleanRequestMessages(event.messages) };
+		const messages = cleanRequestMessages(event.messages);
+		return { messages: docsTail ? prependDocsToRunPrompt(messages, docsTail.run, docsTail.block) : messages };
 	});
 
-	pi.on("agent_settled", () => { options = undefined; preserveDocs = false; });
+	pi.on("agent_settled", () => { options = undefined; docsTail = undefined; });
 }
