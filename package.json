@@ -1,7 +1,7 @@
 {
   "name": "@ssk_dev/pi-docs-slim",
-  "version": "0.3.1",
-  "description": "Keep Pi's built-in documentation guidance out of the system prompt unless you ask for it with /pi. Fork of pi-slim, updated for Pi 0.87.1+ (tested on 1.0).",
+  "version": "0.3.2",
+  "description": "Keep Pi's built-in documentation guidance out of the system prompt unless you ask for it with /pi. Fork of pi-slim, updated for Pi 0.87.1+ (tested on 1.4).",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -11,7 +11,8 @@
   ],
   "author": "kunkun9527",
   "contributors": [
-    "Rob Zolkos <rob@zolkos.com> (original pi-slim)"
+    "Rob Zolkos <rob@zolkos.com> (original pi-slim)",
+    "Echokovo (https://github.com/Echokovo)"
   ],
   "license": "MIT",
   "type": "module",
