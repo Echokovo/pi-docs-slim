@@ -97,15 +97,29 @@ export function cleanRequestMessages(messages: Message[]): Message[] {
 		const clean = cleanSystemMessage(message);
 		if (clean.sections?.docs !== undefined) {
 			const docs = clean.sections.docs;
-			// The marker is not content: drop it from the request like a deletion tombstone.
+			// The marker means "no docs": a removal only when custom docs are in effect, otherwise nothing.
 			const omitted = typeof docs === "string" && isOmitMarkerSection(docs);
-			if (omitted || (docs === null && !customDocsPresent)) delete clean.sections.docs;
-			else customDocsPresent = docs !== null;
+			if (omitted) clean.sections.docs = null;
+			if (clean.sections.docs === null && !customDocsPresent) delete clean.sections.docs;
+			customDocsPresent = !omitted && docs !== null;
 		}
 		// Do not send redundant empty system updates or "remove docs" instructions.
-		const emptyContent = typeof clean.content === "string" ? clean.content.length === 0 : clean.content.every(block => block.text.length === 0);
-		if (index > 0 && emptyContent && !Object.keys(clean.sections ?? {}).length
-			&& !clean.toolsAdded?.length && !clean.toolsRemoved?.length) return [];
-		return [clean];
+		return index > 0 && isEmptySystem(clean) ? [] : [clean];
 	});
+}
+
+/** A /pi run keeps Pi's docs, but the saved omission marker still must not reach the provider. */
+export function dropOmitMarkers(messages: Message[]): Message[] {
+	return messages.flatMap<Message>((message, index) => {
+		const docs = message.role === "system" ? message.sections?.docs : undefined;
+		if (message.role !== "system" || typeof docs !== "string" || !isOmitMarkerSection(docs)) return [message];
+		const { docs: _marker, ...sections } = message.sections!;
+		const clean = { ...message, sections };
+		return index > 0 && isEmptySystem(clean) ? [] : [clean];
+	});
+}
+
+function isEmptySystem(message: SystemMessage): boolean {
+	const emptyContent = typeof message.content === "string" ? message.content.length === 0 : message.content.every(block => block.text.length === 0);
+	return emptyContent && !Object.keys(message.sections ?? {}).length && !message.toolsAdded?.length && !message.toolsRemoved?.length;
 }
