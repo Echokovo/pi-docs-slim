@@ -21,7 +21,7 @@ Requires Pi 0.87.1 or newer (tested on 0.87.1, 1.0.0 and 1.4.0).
 ## Usage
 
 - Normal requests: Pi's documentation guidance is removed from what the model sees.
-- `/pi <question about Pi>`: this run reads the guidance at the head of its own message instead of in the system prompt, and keeps it for its tool-call turns. The next normal request goes back to removing it.
+- `/pi <question about Pi>`: this run reads the guidance at the head of its own message instead of in the system prompt, and keeps it for its tool-call turns. The transcript shows a one-line `📖 pi-docs` marker above that message, so you can see which run carried it. The next normal request goes back to removing it.
 - Your own `<docs>` blocks, project instructions, and code examples are left alone. Saved user messages, assistant replies, and tool output are never changed (`/pi` only adds the guidance to the request it sends).
 
 After installing or updating, run `/reload`, send a normal message, and check `/context`.
@@ -60,6 +60,7 @@ Set `PI_SLIM_ENTRY` to run the suite against another implementation.
 
 - Old session files aren't rewritten. `/context`'s Usage view is clean after the next normal request. The Initial view is a snapshot from the first request; reload to refresh it. If that first request was `/pi`, it will include the docs, which is expected.
 - During a `/pi` run, `/context` shows the guidance as content of that message (about 500 tokens). It is added to the request only: the saved session keeps your question as you typed it, and later requests don't carry the guidance.
+- The `📖 pi-docs` marker is a session `CustomEntry`: Pi keeps custom entries out of the model's context, so it adds no prompt tokens, `/context` does not count it, and it stays in the transcript across reloads.
 - Saved sessions keep the ~20-character omission marker in their `docs` section so Pi's per-request section diff converges. The marker is removed from every request and never reaches the model. `/context` may still count it (about 5 tokens): pi-context-view 0.6.0 reads the saved transcript, and 0.8.0 captures each request before this extension cleans it when it loads first. That is pi-context-view's documented behavior for handlers that run after it (see its [capture notes](https://github.com/dimk90/pi-context-view/blob/develop/doc/architecture/capture.md)); you don't need to change your load order.
 - If the model reads Pi's docs with a tool, that output is kept.
 - The cleanup relies on Pi 0.87.1's event order. Rerun the tests after upgrading Pi. If another extension re-injects the docs after the final context step, they won't be removed.

@@ -1,12 +1,37 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { BeforeAgentStartEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { cleanRequestMessages, extractBuiltinDocs, isBuiltinDocs, OMIT_DOCS, prependDocsToRunPrompt, renderDocsBlock, type RunPrompt, stripPiDocs } from "./docs.ts";
+
+/**
+ * Transcript marker for a run whose request carries the guidance. Custom entries are rendered by
+ * this extension and never reach the model, so the marker costs nothing in the prompt or the cache.
+ */
+const RUN_MARKER = "pi-docs";
+
+interface RunMarker {
+	/** Approximate size of the guidance that request added. */
+	tokens?: number;
+}
+
+/** Coarse estimate rounded to the nearest ten; Pi's guidance is about 500 tokens. */
+function estimateTokens(text: string): number {
+	return Math.round(text.length / 40) * 10;
+}
 
 export default function piSlim(pi: ExtensionAPI) {
 	// Correlate the actual async submission, not whichever input happens to run next.
 	const requests = new AsyncLocalStorage<{ consumed: boolean }>();
 	let docsTail: { run: RunPrompt; block: string } | undefined;
 	let options: BeforeAgentStartEvent["systemPromptOptions"] | undefined;
+
+	// The guidance is added to the request only, so the transcript would otherwise show a plain
+	// user message. This marker row says which run carried it.
+	pi.registerEntryRenderer<RunMarker>(RUN_MARKER, (entry, _options, theme) => {
+		const tokens = entry.data?.tokens;
+		const detail = tokens ? ` (~${tokens} tokens)` : "";
+		return new Text(`${theme.fg("accent", "📖 pi-docs")} ${theme.fg("muted", `Pi's docs guidance heads the request below${detail}`)}`, 0, 0);
+	});
 
 	pi.registerCommand("pi", {
 		description: "Run a request with Pi's built-in documentation guidance enabled",
@@ -42,7 +67,11 @@ export default function piSlim(pi: ExtensionAPI) {
 		// Pi still owns their generation, including refreshes between tool calls.
 		// /pi receives the guidance at the head of its own message instead of in the prompt, so
 		// the request keeps the prefix of earlier requests and the provider's prompt cache holds.
-		if (guidance !== undefined && prompt !== undefined) docsTail = { run: { prompt }, block: renderDocsBlock(guidance) };
+		if (guidance !== undefined && prompt !== undefined) {
+			const block = renderDocsBlock(guidance);
+			docsTail = { run: { prompt }, block };
+			pi.appendEntry(RUN_MARKER, { tokens: estimateTokens(block) });
+		}
 	});
 
 	// A forced prompt (another extension returned `systemPrompt`) is final once every

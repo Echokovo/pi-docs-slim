@@ -429,12 +429,13 @@ test('request cleanup removes old docs and no-op tombstones without touching use
 });
 
 test('/pi rejects empty and busy submissions without sending anything', async () => {
-  let command; let submissions = 0; const notices = [];
-  slim({ on: () => {}, registerCommand: (_name, spec) => { command = spec; }, sendUserMessage: () => { submissions++; } });
+  let command; let renderer; let submissions = 0; const notices = [];
+  slim({ on: () => {}, registerCommand: (_name, spec) => { command = spec; }, registerEntryRenderer: (type) => { renderer = type; }, sendUserMessage: () => { submissions++; } });
   const ctx = { ui: { notify: (...args) => notices.push(args) }, isIdle: () => true };
   await command.handler('   ', ctx);
   await command.handler('request', { ...ctx, isIdle: () => false });
   assert.equal(submissions, 0); assert.equal(notices.length, 2);
+  assert.equal(renderer, 'pi-docs', 'the transcript marker has no renderer');
 });
 
 test('custom docs removed by a later run do not linger in the request', () => using({ after: [pi => {
@@ -454,6 +455,24 @@ test('/pi after an ordinary request sends the docs but not the saved omission ma
   piDocs(f.requests[1]);
   assert.ok(!JSON.stringify(f.requests[1]).includes('pi-slim:omit'), 'marker sent to provider during /pi');
   samePrompt(f.requests, 'ordinary then /pi');
+}));
+
+test('/pi marks its run in the transcript, and the marker never reaches the provider', () => using({}, async f => {
+  const markers = () => f.session.sessionManager.getEntries().filter(e => e.type === 'custom' && e.customType === 'pi-docs');
+  await f.command('ordinary');
+  assert.equal(markers().length, 0, 'ordinary requests add no marker');
+  await f.command('/pi explain extensions');
+  piDocs(f.requests[1]);
+  assert.equal(markers().length, 1, 'the /pi run adds exactly one marker');
+  assert.ok(markers()[0].data.tokens > 0, 'the marker reports how much guidance the request added');
+  assert.ok(!JSON.stringify(f.requests[1]).includes('pi-docs'), 'the marker reached the provider');
+  const entries = f.session.sessionManager.getEntries();
+  const marker = entries.findIndex(e => e.type === 'custom' && e.customType === 'pi-docs');
+  const asked = entries.findIndex(e => e.type === 'message' && e.message.role === 'user' && userText(e.message).includes('explain extensions'));
+  assert.ok(marker >= 0 && marker < asked, 'the marker must sit above the request it explains');
+  await f.command('ordinary again');
+  assert.equal(markers().length, 1, 'later ordinary requests add no marker');
+  f.viewClean();
 }));
 
 test('extractBuiltinDocs reads Pi\'s own section, never a custom or quoted copy', () => {
