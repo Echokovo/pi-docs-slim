@@ -1,6 +1,6 @@
 {
   "name": "@ssk_dev/pi-docs-slim",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Keep Pi's built-in documentation guidance out of the system prompt unless you ask for it with /pi. Fork of pi-slim, updated for Pi 0.87.1+ (tested on 1.4).",
   "keywords": [
     "pi-package",
