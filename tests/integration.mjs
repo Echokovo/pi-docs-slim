@@ -87,6 +87,7 @@ async function contextView08() {
 }
 const { buildSystemPromptSections } = await import(pathToFileURL(join(root, 'dist/core/system-prompt.js')));
 const nativeDocs = buildSystemPromptSections({ cwd: here }).docs;
+const { prepareCompaction } = await import(pathToFileURL(join(root, 'dist/core/compaction/compaction.js')));
 const DOCS_HEADER = 'Pi documentation (read only';
 const DOCS_BLOCK = '<pi_docs>';
 const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
@@ -268,6 +269,9 @@ test('custom docs, fenced examples, and project instructions are preserved', () 
 const noopTool = pi => pi.registerTool({ name: 'switch_tools', label: 'Noop', description: 'No-op', parameters: { type: 'object', properties: {} },
   async execute() { return { content: [{ type: 'text', text: 'done' }], details: {} }; } });
 const toolOnFirst = n => n === 1 ? { content: [{ type: 'toolCall', id: `noop-${n}`, name: 'switch_tools', arguments: {} }], stopReason: 'toolUse' } : undefined;
+// The /pi transcript marker: a CustomEntry written once the guidance really went into a request.
+const runMarkers = (entries) => entries.filter(e => e.type === 'custom' && e.customType === 'pi-docs');
+const askedEntry = (entries, text) => entries.find(e => e.type === 'message' && e.message.role === 'user' && userText(e.message).includes(text));
 
 for (const captureFirst of [false, true]) {
   test(`context-view loaded ${captureFirst ? 'before' : 'after'} slim: clean requests, one saved system message, no forced label`, () => using({ captureFirst, after: [noopTool], replies: toolOnFirst }, async f => {
@@ -329,6 +333,7 @@ test('/pi keeps the guidance on one message across tool turns; ordinary requests
   await f.command('/pi explain tools');
   assert.equal(f.requests.length, 2);
   assert.deepEqual(f.requests.map(piDocs)[1], f.requests.map(piDocs)[0], 'the guidance must stay on the same message so the prefix stays cached');
+  assert.equal(runMarkers(f.session.sessionManager.getEntries()).length, 1, 'tool turns of one /pi run must add one marker, not one per request');
   samePrompt(f.requests, '/pi tool turns');
   await f.command('ordinary');
   assert.equal(f.requests.length, 4);
@@ -457,22 +462,80 @@ test('/pi after an ordinary request sends the docs but not the saved omission ma
   samePrompt(f.requests, 'ordinary then /pi');
 }));
 
-test('/pi marks its run in the transcript, and the marker never reaches the provider', () => using({}, async f => {
-  const markers = () => f.session.sessionManager.getEntries().filter(e => e.type === 'custom' && e.customType === 'pi-docs');
+test('/pi marks its run between its message and the reply, and the marker never reaches the provider', () => using({}, async f => {
+  const entries = () => f.session.sessionManager.getEntries();
   await f.command('ordinary');
-  assert.equal(markers().length, 0, 'ordinary requests add no marker');
+  assert.equal(runMarkers(entries()).length, 0, 'ordinary requests add no marker');
   await f.command('/pi explain extensions');
   piDocs(f.requests[1]);
-  assert.equal(markers().length, 1, 'the /pi run adds exactly one marker');
-  assert.ok(markers()[0].data.tokens > 0, 'the marker reports how much guidance the request added');
+  const [marker] = runMarkers(entries());
+  assert.equal(runMarkers(entries()).length, 1, 'the /pi run adds exactly one marker');
+  assert.ok(marker.data.tokens > 0, 'the marker reports how much guidance the request added');
   assert.ok(!JSON.stringify(f.requests[1]).includes('pi-docs'), 'the marker reached the provider');
-  const entries = f.session.sessionManager.getEntries();
-  const marker = entries.findIndex(e => e.type === 'custom' && e.customType === 'pi-docs');
-  const asked = entries.findIndex(e => e.type === 'message' && e.message.role === 'user' && userText(e.message).includes('explain extensions'));
-  assert.ok(marker >= 0 && marker < asked, 'the marker must sit above the request it explains');
+  assert.equal(marker.parentId, askedEntry(entries(), 'explain extensions').id, 'the marker must follow the message it explains');
+  const reply = entries().find(e => e.parentId === marker.id);
+  assert.equal(reply?.message?.role, 'assistant', 'the reply must follow the marker');
   await f.command('ordinary again');
-  assert.equal(markers().length, 1, 'later ordinary requests add no marker');
+  assert.equal(runMarkers(entries()).length, 1, 'later ordinary requests add no marker');
   f.viewClean();
+}));
+
+test('/pi adds no marker when the guidance never went into a request', async () => {
+  // A context handler removed every user message, so there was nothing to prepend the guidance to.
+  await using({ before: [pi => pi.on('context', e => ({ messages: e.messages.filter(m => m.role !== 'user') }))] }, async f => {
+    await f.command('/pi explain extensions');
+    noDocs(f.requests);
+    assert.equal(runMarkers(f.session.sessionManager.getEntries()).length, 0, 'marked a run whose request carried no guidance');
+  });
+  // Project-owned docs replace Pi's guidance, so /pi has none to send.
+  await using({ before: [pi => pi.on('before_agent_start', e => { e.systemPromptOptions.sections.docs = 'PROJECT_DOCS_SECTION'; })] }, async f => {
+    await f.command('/pi explain extensions');
+    noDocs(f.requests);
+    assert.equal(runMarkers(f.session.sessionManager.getEntries()).length, 0, 'marked a run that sent project docs only');
+  });
+});
+
+test('/tree back to a /pi message leaves its marker on the old branch', () => using({}, async f => {
+  await f.command('ordinary');
+  await f.command('/pi explain extensions');
+  const asked = askedEntry(f.session.sessionManager.getEntries(), 'explain extensions');
+  // Like /fork before a message, /tree to a user message moves the leaf to that message's parent.
+  const result = await f.session.navigateTree(asked.id);
+  assert.equal(result.cancelled, false);
+  assert.equal(f.session.sessionManager.getLeafId(), asked.parentId);
+  assert.equal(runMarkers(f.session.sessionManager.getBranch()).length, 0, 'the marker came along to the new branch');
+  await f.command('ordinary instead');
+  noDocs(f.requests[2]);
+  assert.equal(runMarkers(f.session.sessionManager.getBranch()).length, 0, 'an ordinary request on the new branch shows a /pi marker');
+}));
+
+test('compaction cuts a session with a /pi marker the same way as without it', () => using({ after: [noopTool], replies: toolOnFirst }, async f => {
+  await f.command('first ordinary request');
+  await f.command('/pi explain extensions with a tool call');
+  await f.command('last ordinary request');
+  const path = f.session.sessionManager.getBranch();
+  const [marker] = runMarkers(path);
+  assert.ok(marker, 'the /pi run added no marker');
+  // The same session without the marker: its child hangs off the marker's parent instead.
+  const bare = path.filter(e => e !== marker).map(e => e.parentId === marker.id ? { ...e, parentId: marker.parentId } : e);
+  const total = f.messages().reduce((sum, message) => sum + core.estimateTokens(message), 0);
+  let splits = 0;
+  for (let keepRecentTokens = 1; keepRecentTokens <= total + 1; keepRecentTokens++) {
+    const settings = { enabled: true, reserveTokens: 0, keepRecentTokens };
+    const marked = prepareCompaction(path, settings);
+    const plain = prepareCompaction(bare, settings);
+    const label = `keepRecentTokens=${keepRecentTokens}`;
+    assert.equal(marked === undefined, plain === undefined, `${label}: the marker changed whether there is anything to compact`);
+    if (!plain) continue;
+    assert.equal(marked.isSplitTurn, plain.isSplitTurn, `${label}: the marker changed whether the turn is split`);
+    assert.deepEqual(marked.messagesToSummarize, plain.messagesToSummarize, `${label}: the marker changed what is summarized`);
+    assert.deepEqual(marked.turnPrefixMessages, plain.turnPrefixMessages, `${label}: the marker changed the split-turn prefix`);
+    // The marker may become the first kept entry, but only right before the entry kept without it.
+    const keptAfterMarker = marked.firstKeptEntryId === marker.id && path.find(e => e.parentId === marker.id)?.id === plain.firstKeptEntryId;
+    assert.ok(marked.firstKeptEntryId === plain.firstKeptEntryId || keptAfterMarker, `${label}: the marker moved the cut`);
+    if (plain.isSplitTurn) splits++;
+  }
+  assert.ok(splits > 0, 'the sweep never reached a split turn, so it did not cover the cut next to the marker');
 }));
 
 test('extractBuiltinDocs reads Pi\'s own section, never a custom or quoted copy', () => {
